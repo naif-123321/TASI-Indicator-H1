@@ -1,0 +1,296 @@
+//@version=6
+indicator("مؤشر تاسي الشامل المحسن - H1", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================
+// 1) المدخلات
+// ============================================================
+grp1 = "المتوسطات"
+ema9Len  = input.int(9,  "EMA قصير", group=grp1)
+ema21Len = input.int(21, "EMA متوسط", group=grp1)
+ema40Len = input.int(40, "EMA طويل", group=grp1)
+
+grp2 = "RSI"
+rsiLen       = input.int(7,  "طول RSI (تاسي)", group=grp2)
+rsiEntryMax  = input.int(62, "أقصى RSI للدخول", group=grp2)
+rsiExitLevel = input.int(70, "مستوى RSI للخروج", group=grp2)
+rsiOversold  = input.int(38, "منطقة التشبع البيعي", group=grp2)
+
+grp3 = "MACD"
+macdFast = input.int(12, "MACD Fast", group=grp3)
+macdSlow = input.int(26, "MACD Slow", group=grp3)
+macdSig  = input.int(9,  "MACD Signal", group=grp3)
+
+grp4 = "إدارة المخاطر والوقف المتحرك"
+atrLen      = input.int(14, "طول ATR", group=grp4)
+slMult      = input.float(1.8, "مضاعف وقف الخسارة الأولي", step=0.1, group=grp4)
+tpMult      = input.float(2.8, "مضاعف الهدف", step=0.1, group=grp4)
+useTrailing = input.bool(true, "تفعيل الوقف المتحرك", group=grp4)
+trailMult   = input.float(1.2, "مضاعف الوقف المتحرك", step=0.1, group=grp4)
+useBreakEven = input.bool(true, "تفعيل نقل الوقف للتعادل (Break-Even)", group=grp4)
+lineLen     = input.int(15, "طول الخطوط القصيرة (شمعة)", group=grp4)
+
+grp5 = "إدارة رأس المال"
+accountSize = input.float(10000, "حجم الحساب (ريال)", group=grp5, step=1000)
+riskPct     = input.float(1.0, "نسبة المخاطرة لكل صفقة (%)", group=grp5, step=0.5)
+
+grp6 = "فلاتر"
+useADX      = input.bool(true, "اشتراط قوة الاتجاه (ADX)", group=grp6)
+adxLen      = input.int(14, "طول ADX", group=grp6)
+adxMin      = input.int(25, "الحد الأدنى لـ ADX", group=grp6)
+useVol      = input.bool(true, "اشتراط الحجم فوق المتوسط", group=grp6)
+volLen      = input.int(20, "متوسط الحجم", group=grp6)
+htfFilter   = input.bool(true, "اشتراط الاتجاه اليومي صاعد", group=grp6)
+useTime     = input.bool(true, "فلتر وقت التداول", group=grp6)
+tradeSess   = input.session("1000-1500", "نافذة التداول", group=grp6)
+cooldownBars = input.int(6, "تبريد بين الصفقات (شموع)", group=grp6, minval=0)
+sidewaysFilter = input.bool(true, "فلتر تجنب النطاقات العرضية", group=grp6)
+relaxedMode = input.bool(false, "الوضع المرن (شروط أقل)", group=grp6)
+
+// ============================================================
+// 2) الحسابات
+// ============================================================
+ema9  = ta.ema(close, ema9Len)
+ema21 = ta.ema(close, ema21Len)
+ema40 = ta.ema(close, ema40Len)
+rsi   = ta.rsi(close, rsiLen)
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSig)
+atr    = ta.atr(atrLen)
+volAvg = ta.sma(volume, volLen)
+
+// حساب ADX
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+adxOk = not useADX or adx > adxMin
+
+// فلتر الاتجاه اليومي
+htfClose = request.security(syminfo.tickerid, "D", close[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfEma40 = request.security(syminfo.tickerid, "D", ta.ema(close, 40)[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfOk = not htfFilter or (not na(htfClose) and not na(htfEma40) and htfClose > htfEma40)
+
+// فلتر وقت التداول
+inSess = not useTime or not na(time(timeframe.period, tradeSess))
+
+// فلتر النطاقات العرضية
+rangeHigh = ta.highest(high, 40)
+rangeLow  = ta.lowest(low, 40)
+rangeWidth = rangeHigh - rangeLow
+sidewaysOk = not sidewaysFilter or rangeWidth > atr * 2.2
+
+// فلتر الزخم
+momentumFilter = (macdLine > signalLine) and (histLine > 0)
+
+// ============================================================
+// 3) متغيرات إدارة الصفقة
+// ============================================================
+var bool  inTrade    = false
+var float entryPrice = na
+var float slPrice    = na
+var float tpPrice    = na
+var bool  breakEvenHit = false
+var int   lastExitBar  = na
+
+// ============================================================
+// 4) شروط الدخول
+// ============================================================
+// 1. شراء عند التصحيح (Pullback)
+pullbackTrigger = low <= ema21 and low > ema40 and close > open and close > ema9 and rsi > 42 and rsi < 58 and close > ema40
+
+// 2. شراء عند اختراق الزخم (Breakout)
+breakoutTrigger = close > ta.highest(high, 15)[1] and rsi > 50 and rsi < 65 and close > ema9 and adx > adxMin
+
+// دمج الشروط
+trigger = pullbackTrigger or breakoutTrigger
+
+rsiOk    = rsi > 30 and rsi < rsiEntryMax
+trendOk  = ema9 > ema21 and ema21 > ema40 and close > ema9
+above40  = close > ema40
+volumeOk = not useVol or volume > (volAvg * 1.3)
+
+hourlyTrendConfirm = trendOk or above40
+
+cooldownOk = na(lastExitBar) ? true : bar_index - lastExitBar >= cooldownBars
+
+entrySignal = relaxedMode ?
+    (trigger and hourlyTrendConfirm and rsiOk and inSess and htfOk and adxOk and cooldownOk and sidewaysOk) :
+    (trigger and hourlyTrendConfirm and rsiOk and inSess and htfOk and volumeOk and adxOk and cooldownOk and sidewaysOk and momentumFilter)
+
+potentialTrade = trigger and rsiOk and hourlyTrendConfirm and not inTrade and cooldownOk
+
+// ============================================================
+// 5) شروط الخروج الفني
+// ============================================================
+exitRSI  = rsi > rsiExitLevel
+exitMACD = ta.crossunder(macdLine, signalLine)
+exitEMA  = ta.crossunder(close, ema21)
+exitHTF  = htfFilter and not na(htfClose) and not na(htfEma40) and htfClose < htfEma40
+techExit = exitRSI or exitMACD or exitEMA or exitHTF
+
+// ============================================================
+// 6) إدارة الصفقة
+// ============================================================
+var line  lineEntry  = na
+var line  lineSL     = na
+var line  lineTP     = na
+
+if inTrade
+    // 1. نقل الوقف للتعادل
+    if useBreakEven and not breakEvenHit and high >= entryPrice + atr
+        slPrice := entryPrice
+        breakEvenHit := true
+
+    // 2. تحديث الوقف المتحرك
+    if useTrailing
+        newSl = math.max(slPrice, low[1] - (atr * trailMult))
+        if newSl > slPrice
+            slPrice := newSl
+            if not na(lineSL)
+                line.set_y1(lineSL, slPrice)
+                line.set_y2(lineSL, slPrice)
+
+    // 3. ضرب وقف الخسارة
+    if low <= slPrice
+        inTrade := false
+        lastExitBar := bar_index
+        breakEvenHit := false
+        exitP = math.min(open, slPrice)
+        if not na(lineSL)
+            line.set_color(lineSL, color.red)
+        label.new(bar_index, low, "خروج (وقف)\n" + str.tostring(exitP, "#.##"), style=label.style_label_up, color=color.red, textcolor=color.white, size=size.small)
+
+    // 4. تحقيق الهدف
+    else if high >= tpPrice
+        inTrade := false
+        lastExitBar := bar_index
+        breakEvenHit := false
+        exitP = math.max(open, tpPrice)
+        if not na(lineTP)
+            line.set_color(lineTP, color.green)
+        label.new(bar_index, high, "تم تحقيق الهدف ✔\n" + str.tostring(exitP, "#.##"), style=label.style_label_down, color=color.green, textcolor=color.white, size=size.small)
+
+    // 5. الخروج الفني
+    else if techExit
+        inTrade := false
+        lastExitBar := bar_index
+        breakEvenHit := false
+        if not na(lineEntry)
+            line.set_color(lineEntry, color.orange)
+        label.new(bar_index, high, "خروج فني\n" + str.tostring(close, "#.##"), style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+
+// إدارة الدخول
+if entrySignal and not inTrade
+    inTrade    := true
+    breakEvenHit := false
+    entryPrice := close
+    slPrice    := close - slMult * atr
+    tpPrice    := close + tpMult * atr
+
+    lineEntry := line.new(bar_index, entryPrice, bar_index + lineLen, entryPrice, color=color.white, width=2)
+    lineSL    := line.new(bar_index, slPrice, bar_index + lineLen, slPrice, color=color.red, width=2)
+    lineTP    := line.new(bar_index, tpPrice, bar_index + lineLen, tpPrice, color=color.green, width=2)
+
+    label.new(bar_index, low - atr * 0.3,
+         text = "▲ شراء\nدخول: " + str.tostring(entryPrice, "#.##") +
+                "\nوقف: " + str.tostring(slPrice, "#.##") +
+                "\nالهدف: " + str.tostring(tpPrice, "#.##"),
+         style=label.style_label_up, color=color.white, textcolor=color.black, size=size.small)
+
+// ============================================================
+// 7) الرسم على الشارت
+// ============================================================
+plot(ema9,  "EMA 9",  color=color.new(color.blue, 0), linewidth=1)
+plot(ema21, "EMA 21", color=color.new(color.orange, 0), linewidth=1)
+plot(ema40, "EMA 40", color=color.new(color.red, 0), linewidth=1)
+
+plotshape(entrySignal, "إشارة شراء", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small)
+
+oversoldSignal = rsi < rsiOversold
+plotshape(oversoldSignal and not oversoldSignal[1], "تشبع بيعي", location=location.belowbar, color=color.blue, style=shape.circle, size=size.tiny)
+
+overboughtSignal = rsi > rsiExitLevel
+plotshape(overboughtSignal and not overboughtSignal[1], "تشبع شرائي", location=location.abovebar, color=color.yellow, style=shape.circle, size=size.tiny)
+
+bgcolor(oversoldSignal ? color.new(color.blue, 92) : na, title="منطقة تشبع بيعي")
+
+// ============================================================
+// 8) جدول المؤشرات
+// ============================================================
+var table t = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 70), border_width=1, border_color=color.gray)
+
+fmt(x, n) => str.tostring(x, n)
+
+if barstate.islast
+    trendTxt = ema9 > ema21 and ema21 > ema40 ? "صاعد ✔" : ema9 < ema21 ? "هابط ✘" : "عرضي"
+    trendCol = ema9 > ema21 and ema21 > ema40 ? color.lime : ema9 < ema21 ? color.red : color.orange
+
+    rsiTxt = rsi > rsiExitLevel ? "تشبع شرائي" : rsi < rsiOversold ? "تشبع بيعي" : "محايد"
+    rsiCol = rsi > rsiExitLevel ? color.red : rsi < rsiOversold ? color.aqua : color.white
+
+    macdTxt = histLine > 0 ? "زخم صاعد" : "زخم هابط"
+    macdCol = histLine > 0 ? color.lime : color.red
+
+    adxTxt = adx > adxMin ? "قوي (" + fmt(adx, "#.##") + ")" : "ضعيف (" + fmt(adx, "#.##") + ")"
+    adxCol = adx > adxMin ? color.lime : color.orange
+
+    volTxt = volume > volAvg ? "فوق المتوسط" : "ضعيف"
+    volCol = volume > volAvg ? color.lime : color.orange
+
+    htfTxt = not na(htfClose) and not na(htfEma40) ? (htfClose > htfEma40 ? "صاعد" : "هابط") : "غير متوفر"
+    htfCol = not na(htfClose) and not na(htfEma40) and htfClose > htfEma40 ? color.lime : color.red
+
+    statusTxt = inTrade ? "صفقة مفتوحة" : potentialTrade ? "صفقة محتملة" : "لا صفقة"
+    statusCol = inTrade ? color.lime : potentialTrade ? color.orange : color.gray
+
+    table.cell(t, 0, 0, "المؤشر", text_color=color.white, bgcolor=color.new(color.blue, 60))
+    table.cell(t, 1, 0, "الحالة",  text_color=color.white, bgcolor=color.new(color.blue, 60))
+
+    table.cell(t, 0, 1, "الاتجاه", text_color=color.white)
+    table.cell(t, 1, 1, trendTxt, text_color=trendCol)
+
+    table.cell(t, 0, 2, "RSI", text_color=color.white)
+    table.cell(t, 1, 2, fmt(rsi, "#.##") + " (" + rsiTxt + ")", text_color=rsiCol)
+
+    table.cell(t, 0, 3, "MACD", text_color=color.white)
+    table.cell(t, 1, 3, macdTxt, text_color=macdCol)
+
+    table.cell(t, 0, 4, "قوة الاتجاه (ADX)", text_color=color.white)
+    table.cell(t, 1, 4, adxTxt, text_color=adxCol)
+
+    table.cell(t, 0, 5, "الحجم", text_color=color.white)
+    table.cell(t, 1, 5, volTxt, text_color=volCol)
+
+    table.cell(t, 0, 6, "الاتجاه اليومي", text_color=color.white)
+    table.cell(t, 1, 6, htfTxt, text_color=htfCol)
+
+    table.cell(t, 0, 7, "الحالة", text_color=color.white)
+    table.cell(t, 1, 7, statusTxt, text_color=statusCol)
+
+    if inTrade
+        table.cell(t, 0, 8, "الدخول → الهدف", text_color=color.white)
+        table.cell(t, 1, 8, fmt(entryPrice,"#.##") + " → " + fmt(tpPrice,"#.##"), text_color=color.green)
+        
+        table.cell(t, 0, 9, "الوقف الحالي", text_color=color.white)
+        table.cell(t, 1, 9, fmt(slPrice,"#.##") + (breakEvenHit ? " (تعادل)" : ""), text_color=color.red)
+        
+        table.cell(t, 0, 10, "الوقف المتحرك", text_color=color.white)
+        table.cell(t, 1, 10, useTrailing ? "مفعل ✔" : "غير مفعل", text_color=useTrailing ? color.lime : color.gray)
+    else
+        for i = 8 to 10
+            table.cell(t, 0, i, "", text_color=color.white)
+            table.cell(t, 1, i, "", text_color=color.white)
+
+    // حساب حجم الصفقة المقترح
+    if inTrade
+        riskAmount = accountSize * (riskPct / 100)
+        riskPerShare = math.abs(entryPrice - slPrice)
+        if riskPerShare > 0
+            shares = math.floor(riskAmount / riskPerShare)
+            table.cell(t, 0, 11, "حجم الصفقة المقترح", text_color=color.white, bgcolor=color.new(color.blue, 80))
+            table.cell(t, 1, 11, str.tostring(shares) + " سهم", text_color=color.yellow, bgcolor=color.new(color.blue, 80))
+
+// ============================================================
+// 9) التنبيهات
+// ============================================================
+alertcondition(entrySignal, "دخول", "إشارة شراء على {{ticker}} @ {{close}}")
+alertcondition(inTrade and low <= slPrice, "وقف خسارة/تعادل", "ضرب وقف الخسارة أو التعادل {{ticker}}")
+alertcondition(inTrade and high >= tpPrice, "الهدف", "تحقق الهدف {{ticker}}")
+alertcondition(inTrade and techExit, "خروج فني", "خروج فني {{ticker}}")
+alertcondition(potentialTrade, "صفقة محتملة", "صفقة محتملة على {{ticker}} (فلاتر تمنع الدخول)")
