@@ -109,8 +109,8 @@ hourlyTrendConfirm = trendOk or above40
 
 cooldownOk = na(lastExitBar) ? true : bar_index - lastExitBar >= cooldownBars
 
-entrySignal = relaxedMode ?
-    (trigger and hourlyTrendConfirm and rsiOk and inSess and htfOk and adxOk and cooldownOk and sidewaysOk) :
+entrySignal = relaxedMode ? 
+    (trigger and hourlyTrendConfirm and rsiOk and inSess and htfOk and adxOk and cooldownOk and sidewaysOk) : 
     (trigger and hourlyTrendConfirm and rsiOk and inSess and htfOk and volumeOk and adxOk and cooldownOk and sidewaysOk and momentumFilter)
 
 potentialTrade = trigger and rsiOk and hourlyTrendConfirm and not inTrade and cooldownOk
@@ -188,8 +188,8 @@ if entrySignal and not inTrade
     lineTP    := line.new(bar_index, tpPrice, bar_index + lineLen, tpPrice, color=color.green, width=2)
 
     label.new(bar_index, low - atr * 0.3,
-         text = "▲ شراء\nدخول: " + str.tostring(entryPrice, "#.##") +
-                "\nوقف: " + str.tostring(slPrice, "#.##") +
+         text = "▲ شراء\nدخول: " + str.tostring(entryPrice, "#.##") + 
+                "\nوقف: " + str.tostring(slPrice, "#.##") + 
                 "\nالهدف: " + str.tostring(tpPrice, "#.##"),
          style=label.style_label_up, color=color.white, textcolor=color.black, size=size.small)
 
@@ -277,7 +277,6 @@ if barstate.islast
             table.cell(t, 0, i, "", text_color=color.white)
             table.cell(t, 1, i, "", text_color=color.white)
 
-    // حساب حجم الصفقة المقترح
     if inTrade
         riskAmount = accountSize * (riskPct / 100)
         riskPerShare = math.abs(entryPrice - slPrice)
